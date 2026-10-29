@@ -1,0 +1,57 @@
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      containers:
+        required: true
+        type: string
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+    - id: auth
+      name: Authenticate with GCP
+      uses: google-github-actions/auth@v3
+      with:
+        project_id: '${{ vars.PROJECT_ID }}'
+        workload_identity_provider: '${{ vars.WORKLOAD_IDENTITY_PROVIDER }}'
+    
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v3
+
+    - name: Deploy to Cloud Run
+      env:
+        SERVICE: "${{ vars.SERVICE }}"
+        PROJECT_ID: "${{ vars.PROJECT_ID }}"
+        REGION: "${{ vars.REGION }}"
+        REGISTRY_URL: "${{ vars.REGISTRY_URL }}"
+        CONTAINERS: "${{ inputs.containers }}"
+      run: |
+        set -euo pipefail
+
+        args=()
+        while IFS= read -r container; do
+          name=$(jq -r '.name' <<< "$container")
+          image=$(jq -r '.image' <<< "$container")
+
+          echo "Deploying $name -> $REGISTRY_URL/$image"
+          args+=(
+            "--container=$name"
+            "--image=$REGISTRY_URL/$image"
+          )
+        done < <(jq -c '.[]' <<< "$CONTAINERS")
+
+        gcloud run services update "$SERVICE" \
+          --project="$PROJECT_ID" \
+          --region="$REGION" \
+          "${args[@]}" \
+          --quiet
