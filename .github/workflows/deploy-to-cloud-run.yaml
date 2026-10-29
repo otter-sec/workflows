@@ -53,5 +53,5 @@ jobs:
         gcloud run services update "$SERVICE" \
           --project="$PROJECT_ID" \
           --region="$REGION" \
-          "${args[@]}" \
           --quiet
+          "${args[@]}"
