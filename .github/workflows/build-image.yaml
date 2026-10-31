@@ -16,6 +16,12 @@ on:
       context:
         type: string
         default: .
+      target:
+        type: string
+        default: ''
+      build_args:
+        type: string
+        default: ''
       use_submodule_ssh:
         required: false
         type: boolean
@@ -36,16 +42,19 @@ jobs:
     env:
       IMAGE_NAME: ${{ vars.REGISTRY_URL }}/${{ inputs.name }}
       IMAGE_TAG: ${{ inputs.tag }}
+      CACHE_REF: ${{ vars.REGISTRY_URL }}/cache/${{ inputs.name }}
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
 
     - name: Setup submodules
       if: ${{ inputs.use_submodule_ssh }}
       env:
         SSH_KEY: ${{ secrets.SUBMODULE_SSH_KEY }}
       run: |
-        set -euox pipefail
+        set -euo pipefail
 
         mkdir -p ~/.ssh
         chmod 700 ~/.ssh
@@ -55,33 +64,60 @@ jobs:
         git submodule update --init --recursive
 
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
+      uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-    - name: Build Docker image
-      uses: docker/build-push-action@v6
-      with:
-        context: ${{ inputs.context }}
-        file: ${{ inputs.dockerfile }}
-        push: false # GCP credentials are short-lived (5 minutes), so we can't init creds first, have possibly >5 min build, and then push using those creds
-        load: true
-        tags: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }},${{ env.IMAGE_NAME }}:latest
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
-
+    # GCP credentials are short-lived (5 minutes) and a cold build can take
+    # longer, so the build runs twice: authenticate, import the layer cache and
+    # build without pushing; then authenticate again and let a second, fully
+    # cached pass push the image and export the cache with fresh credentials.
+    # The cache lives in the registry because GitHub Actions caches are scoped
+    # to a git ref, and every release tag is a new ref.
     - id: auth
       name: Authenticate with GCP
-      uses: google-github-actions/auth@v2
+      uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
       with:
         project_id: '${{ vars.PROJECT_ID }}'
         workload_identity_provider: '${{ vars.WORKLOAD_IDENTITY_PROVIDER }}'
-    
+
     - name: Set up Cloud SDK
-      uses: google-github-actions/setup-gcloud@v2
+      uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
 
-    - name: Configure Docker
-      run: gcloud auth configure-docker ${{ vars.REGION }}-docker.pkg.dev
-
-    - name: Push image
+    - name: Log in to the registry
       run: |
-        docker push ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
-        docker push ${{ env.IMAGE_NAME }}:latest
+        gcloud auth print-access-token \
+          | docker login -u oauth2accesstoken --password-stdin "${{ vars.REGION }}-docker.pkg.dev"
+
+    - name: Build image
+      uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+      with:
+        context: ${{ inputs.context }}
+        file: ${{ inputs.dockerfile }}
+        target: ${{ inputs.target }}
+        build-args: ${{ inputs.build_args }}
+        push: false
+        provenance: false
+        cache-from: type=registry,ref=${{ env.CACHE_REF }}
+
+    - name: Authenticate with GCP again
+      uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+      with:
+        project_id: '${{ vars.PROJECT_ID }}'
+        workload_identity_provider: '${{ vars.WORKLOAD_IDENTITY_PROVIDER }}'
+
+    - name: Log in to the registry again
+      run: |
+        gcloud auth print-access-token \
+          | docker login -u oauth2accesstoken --password-stdin "${{ vars.REGION }}-docker.pkg.dev"
+
+    - name: Push image and layer cache
+      uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+      with:
+        context: ${{ inputs.context }}
+        file: ${{ inputs.dockerfile }}
+        target: ${{ inputs.target }}
+        build-args: ${{ inputs.build_args }}
+        push: true
+        provenance: false
+        tags: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }},${{ env.IMAGE_NAME }}:latest
+        cache-from: type=registry,ref=${{ env.CACHE_REF }}
+        cache-to: type=registry,ref=${{ env.CACHE_REF }},mode=max,image-manifest=true,oci-mediatypes=true
