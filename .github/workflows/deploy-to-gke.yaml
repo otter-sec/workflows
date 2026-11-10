@@ -20,26 +20,52 @@ jobs:
     steps:
     - id: auth
       name: Authenticate with GCP
-      uses: google-github-actions/auth@v3
+      uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
       with:
         project_id: '${{ vars.PROJECT_ID }}'
         workload_identity_provider: '${{ vars.WORKLOAD_IDENTITY_PROVIDER }}'
-    
+
     - name: Set up Cloud SDK
-      uses: google-github-actions/setup-gcloud@v3
+      uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
 
     - name: Set up GKE credentials
-      uses: google-github-actions/get-gke-credentials@v3
+      uses: google-github-actions/get-gke-credentials@3da1e46a907576cefaa90c484278bb5b259dd395 # v3.0.0
       with:
         cluster_name: ${{ vars.GKE_CLUSTER }}
 
     - name: Rollout new image
+      env:
+        CONTAINERS: ${{ inputs.containers }}
+        REGISTRY_URL: ${{ vars.REGISTRY_URL }}
+        NAMESPACE: ${{ vars.NAMESPACE }}
+        RESOURCE_TYPE: ${{ vars.RESOURCE_TYPE }}
+        RESOURCE_NAME: ${{ vars.RESOURCE_NAME }}
       run: |
-        CONTAINERS=$(echo -n '${{ inputs.containers }}' | sed 's|=|=${{ vars.REGISTRY_URL }}/|g')
-        echo $CONTAINERS
+        set -euo pipefail
 
-        kubectl set image -n ${{ vars.NAMESPACE }} ${{ vars.RESOURCE_TYPE }}/${{ vars.RESOURCE_NAME }} $CONTAINERS
+        # CONTAINERS is a whitespace-separated list of name=image pairs.
+        read -ra pairs <<< "$CONTAINERS"
+        args=()
+        for pair in "${pairs[@]}"; do
+          if [[ ! "$pair" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?=[^=]+$ ]]; then
+            echo "Invalid container spec: $pair (expected name=image)" >&2
+            exit 1
+          fi
+          args+=("${pair%%=*}=$REGISTRY_URL/${pair#*=}")
+        done
+
+        if [[ ${#args[@]} -eq 0 ]]; then
+          echo "No containers given" >&2
+          exit 1
+        fi
+
+        printf '%s\n' "${args[@]}"
+        kubectl set image -n "$NAMESPACE" "$RESOURCE_TYPE/$RESOURCE_NAME" "${args[@]}"
 
     - name: Wait for rollout
+      env:
+        NAMESPACE: ${{ vars.NAMESPACE }}
+        RESOURCE_TYPE: ${{ vars.RESOURCE_TYPE }}
+        RESOURCE_NAME: ${{ vars.RESOURCE_NAME }}
       run: |
-        kubectl rollout status -n ${{ vars.NAMESPACE }} ${{ vars.RESOURCE_TYPE }}/${{ vars.RESOURCE_NAME }} --timeout=120s
+        kubectl rollout status -n "$NAMESPACE" "$RESOURCE_TYPE/$RESOURCE_NAME" --timeout=120s

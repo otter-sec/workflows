@@ -29,6 +29,10 @@ on:
     secrets:
       SUBMODULE_SSH_KEY:
         required: false
+    outputs:
+      digest:
+        description: Digest (sha256:…) of the pushed image index, as reported by docker/build-push-action
+        value: ${{ jobs.build.outputs.digest }}
 
 jobs:
   build:
@@ -39,7 +43,11 @@ jobs:
       contents: read
       id-token: write
 
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+
     env:
+      REGISTRY_HOST: ${{ vars.REGION }}-docker.pkg.dev
       IMAGE_NAME: ${{ vars.REGISTRY_URL }}/${{ inputs.name }}
       IMAGE_TAG: ${{ inputs.tag }}
       CACHE_REF: ${{ vars.REGISTRY_URL }}/cache/${{ inputs.name }}
@@ -72,20 +80,25 @@ jobs:
     # cached pass push the image and export the cache with fresh credentials.
     # The cache lives in the registry because GitHub Actions caches are scoped
     # to a git ref, and every release tag is a new ref.
+    #
+    # No credentials file is written: it would land in GITHUB_WORKSPACE, i.e.
+    # inside the Docker build context. Direct Workload Identity Federation
+    # (no service account) cannot mint an access_token, so the masked federated
+    # token from the auth_token output is used for the registry login instead.
     - id: auth
       name: Authenticate with GCP
       uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
       with:
         project_id: '${{ vars.PROJECT_ID }}'
         workload_identity_provider: '${{ vars.WORKLOAD_IDENTITY_PROVIDER }}'
-
-    - name: Set up Cloud SDK
-      uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+        create_credentials_file: false
 
     - name: Log in to the registry
+      env:
+        TOKEN: ${{ steps.auth.outputs.auth_token }}
       run: |
-        gcloud auth print-access-token \
-          | docker login -u oauth2accesstoken --password-stdin "${{ vars.REGION }}-docker.pkg.dev"
+        printf '%s' "$TOKEN" \
+          | docker login -u oauth2accesstoken --password-stdin "$REGISTRY_HOST"
 
     - name: Build image
       uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -98,18 +111,25 @@ jobs:
         provenance: false
         cache-from: type=registry,ref=${{ env.CACHE_REF }}
 
-    - name: Authenticate with GCP again
+    - id: auth_push
+      name: Authenticate with GCP again
       uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
       with:
         project_id: '${{ vars.PROJECT_ID }}'
         workload_identity_provider: '${{ vars.WORKLOAD_IDENTITY_PROVIDER }}'
+        create_credentials_file: false
 
     - name: Log in to the registry again
+      env:
+        TOKEN: ${{ steps.auth_push.outputs.auth_token }}
       run: |
-        gcloud auth print-access-token \
-          | docker login -u oauth2accesstoken --password-stdin "${{ vars.REGION }}-docker.pkg.dev"
+        printf '%s' "$TOKEN" \
+          | docker login -u oauth2accesstoken --password-stdin "$REGISTRY_HOST"
 
-    - name: Push image and layer cache
+    # Provenance uses mode=min: build_args is caller-supplied and mode=max
+    # would publish build-arg values in the attestation.
+    - id: push
+      name: Push image and layer cache
       uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
       with:
         context: ${{ inputs.context }}
@@ -117,7 +137,24 @@ jobs:
         target: ${{ inputs.target }}
         build-args: ${{ inputs.build_args }}
         push: true
-        provenance: false
+        provenance: mode=min
+        sbom: true
         tags: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }},${{ env.IMAGE_NAME }}:latest
         cache-from: type=registry,ref=${{ env.CACHE_REF }}
         cache-to: type=registry,ref=${{ env.CACHE_REF }},mode=max,image-manifest=true,oci-mediatypes=true
+
+    - name: Record image digest
+      env:
+        DIGEST: ${{ steps.push.outputs.digest }}
+      run: |
+        set -euo pipefail
+        echo "Pushed $IMAGE_NAME:$IMAGE_TAG@$DIGEST"
+        {
+          echo "### Image"
+          echo
+          echo "| | |"
+          echo "|---|---|"
+          echo "| Image | \`$IMAGE_NAME\` |"
+          echo "| Tags | \`$IMAGE_TAG\`, \`latest\` |"
+          echo "| Digest | \`$DIGEST\` |"
+        } >> "$GITHUB_STEP_SUMMARY"
